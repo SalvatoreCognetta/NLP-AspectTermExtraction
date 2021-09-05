@@ -46,6 +46,11 @@ torch.backends.cudnn.deterministic = True
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEBUGGING = False
 
+class dotdict(dict):
+    """dot.notation access to dictionary attributes"""
+    __getattr__ = dict.get
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
 
 def build_model_b(device: str) -> Model:
     """
@@ -179,6 +184,134 @@ class RandomBaseline(Model):
             preds.append(pred_sample)
         return preds
 
+class BertCatExtrModel(nn.Module):
+    def __init__(self, hparams: dotdict):
+        super(BertCatExtrModel, self).__init__()
+
+        # self.hparams = hparams
+        self.lr = hparams.lr
+        self.n_epochs = hparams.n_epochs
+        self.warmup_steps = hparams.warmup_steps
+
+        model_name = hparams.model_name
+
+        # Load transformers config and set output_hidden_states to False
+        self.bert = DistilBertModel.from_pretrained(model_name, output_hidden_states=True)
+
+        hidden_size = self.bert.config.hidden_size
+
+        self.pre_layernorm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(hparams.dropout)
+        self.pre_classifier = nn.Linear(hidden_size, hidden_size)
+        self.relu = nn.ReLU()
+        self.layernorm = nn.LayerNorm(hidden_size)
+        # Dropout
+
+        # Multi-head binary classification
+        self.ambience   = nn.Linear(hidden_size, 1)
+        self.anecd_misc = nn.Linear(hidden_size, 1)
+        self.food       = nn.Linear(hidden_size, 1)
+        self.service    = nn.Linear(hidden_size, 1)
+        self.price      = nn.Linear(hidden_size, 1)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        inputs = {'input_ids': input_ids, 'attention_mask': attention_mask}
+
+        x = self.bert(**inputs).last_hidden_state[:,0,:]
+
+
+        x = self.pre_layernorm(x)
+        x = self.dropout(x)
+        x = self.pre_classifier(x)
+        x = self.relu(x)
+        x = self.layernorm(x)
+        x = self.dropout(x)
+
+        out1 = self.sigmoid(torch.squeeze(self.ambience(x)))
+        out2 = self.sigmoid(torch.squeeze(self.anecd_misc(x)))
+        out3 = self.sigmoid(torch.squeeze(self.food(x)))
+        out4 = self.sigmoid(torch.squeeze(self.service(x)))
+        out5 = self.sigmoid(torch.squeeze(self.price(x)))
+        
+
+        outputs = out1, out2, out3, out4, out5
+
+        return outputs
+
+class BertCatExtrClassifier(pl.LightningModule):
+    def __init__(self, hparams: dotdict):
+        super(BertCatExtrClassifier, self).__init__()
+        
+        self.save_hyperparameters(hparams)
+        self.model = BertCatExtrModel(self.hparams)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels=None) -> torch.Tensor:
+         return self.model(input_ids, attention_mask)
+
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
+
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        labels = batch['labels']
+
+        outputs = self.forward(input_ids, attention_mask)
+        
+        loss = self.loss_fn(outputs, labels)
+        
+        self.log("train_loss", loss, prog_bar=True, logger=True)
+
+        return {"loss":loss, "predictions":outputs, "labels":labels}
+
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        labels = batch['labels']
+
+        outputs = self.forward(input_ids, attention_mask, labels)
+
+        loss = self.loss_fn(outputs, labels)
+        
+        self.log("val_loss", loss, prog_bar=True, logger=True)
+
+        return {"loss": loss}
+
+    def training_epoch_end(self, outputs):
+        labels = []
+        predictions = []
+
+        for output in outputs:
+            for label in output['labels']:
+                labels.append(label)
+
+            for prediction in output['predictions']:
+                predictions.append(prediction)
+
+    def configure_optimizers(self):
+        return optim.Adam(self.parameters(),lr=self.hparams.lr)
+
+    def loss_fn(self, outputs, targets):
+        o1, o2, o3, o4, o5 = outputs
+
+        t1 = targets[:,:1].view(-1)
+        t2 = targets[:,1:2].view(-1)
+        t3 = targets[:,2:3].view(-1)
+        t4 = targets[:,3:4].view(-1)
+        t5 = targets[:,4:5].view(-1)
+
+        try:
+            l1 = nn.BCELoss()(o1, t1)
+            l2 = nn.BCELoss()(o2, t2)
+            l3 = nn.BCELoss()(o3, t3)
+            l4 = nn.BCELoss()(o4, t4)
+            l5 = nn.BCELoss()(o5, t5)
+
+            return (l1 + l2 + l3 + l4 + l5) / 5
+        except Exception as e:
+            print(e)
+
+
 class BertDataset(Dataset):
     def __init__(self, 
                  inputs:List[Dict], 
@@ -246,13 +379,13 @@ class BertDataset(Dataset):
             elif self.mode == 'd':
                 categories = input['categories']
                 for category in categories:
-                    cat = [category[0]]
+                    cat = [category]
                     sentences['text'].append(tokenized_sentence)
                     sentences['categories'].append(cat)
                     sentences['full_sentence'].append(text_)             
                 if not categories:
                     sentences['text'].append(tokenized_sentence)
-                    sentences['categories'].append(cat)
+                    sentences['categories'].append([''])
                     sentences['full_sentence'].append(text_)
             elif self.mode == 'ab' or  self.mode == 'cd':
                 # Append to the list of sentences
@@ -267,9 +400,7 @@ class BertDataset(Dataset):
     def __getitem__(self, idx):
         if self.encoded_input is None:
             raise RuntimeError("""Trying to retrieve elements but index_dataset
-            has not been invoked yet! Be sure to invoce index_dataset on this object
-            before trying to retrieve elements. In case you want to retrieve raw
-            elements, use the method get_raw_element(idx)""")
+            has not been invoked yet!""")
 
         item = {key: torch.tensor(val[idx]) for key, val in self.encoded_input.items()}
         return item
@@ -316,7 +447,7 @@ class StudentModel(Model):
 
         self.model_a = DistilBertForTokenClassification.from_pretrained('./model/a/', local_files_only=True, num_labels=2).to(DEVICE)
         self.model_a.eval() # Bert is set to eval mode by default
-        self.tokenizer_a = DistilBertTokenizerFast.from_pretrained('distilbert-base-cased')
+        self.tokenizer_a = DistilBertTokenizerFast.from_pretrained('./model/tokenizer/a/')
 
         self.treshold_conflict_b = 0.05
         self.model_b = DistilBertForSequenceClassification.from_pretrained('./model/b/', local_files_only=True, num_labels=4).to(DEVICE)
@@ -331,7 +462,7 @@ class StudentModel(Model):
             ],
         )
 
-        self.model_c = DistilBertForSequenceClassification.from_pretrained('./model/c/', num_labels=5).to(DEVICE)
+        self.model_c =  BertCatExtrClassifier.load_from_checkpoint('./model/c/best_model.ckpt').to(DEVICE)
         self.model_c.eval()
         self.tokenizer_c = DistilBertTokenizerFast.from_pretrained('./model/tokenizer/c/') # Same as tokenizer a
 
@@ -500,7 +631,7 @@ class StudentModel(Model):
             # Take sentence and targets            
             text, category, full_sentence = dataset.get_raw_sentence(idx)
             # If there are no targets the output is an empty list
-            if len(category) == 1 and category[0] == '':
+            if len(category) == 0 or len(category) == 1 and category[0] == '':
                 outputs.append({"categories":[]})
             else:
                 # Tokenize the sentence
@@ -536,14 +667,18 @@ class StudentModel(Model):
             text, full_sentence = dataset.get_raw_sentence(idx)
 
             inputs = self.tokenizer_c(text, is_split_into_words=True, return_tensors='pt').to(DEVICE)
-            output = self.model_c(**inputs).logits
-            with torch.no_grad():
-                prediction = torch.argmax(output, dim=1)[0]
+            output = self.model_c(**inputs)
+            #TODO CHANGE here
+            prediction = [1 if out.item() >= 0.5 else 0  for out in output]
 
-            prediction = dataset.id2category[prediction.item()]
+            predictions_text = []
+            for i in range(len(prediction)):
+                category_text = dataset.id2category[i]
+                if prediction[i] == 1:
+                    predictions_text.append(category_text)
 
-            samples.append({"categories": [[prediction]], "text": full_sentence})
 
+            samples.append({"categories": predictions_text, "text": full_sentence})
         # Predict the polarity of the found aspect term
         dataset_d = BertDataset(samples, self.tokenizer_d, mode='d', lowercase=False)
         dataset_d.encode_dataset()
